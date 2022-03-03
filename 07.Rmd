@@ -215,6 +215,54 @@ conf_mat_resampled(nb_rs, tidy = FALSE) %>%
   autoplot(type = "heatmap")
 ```
 
+## Compare to Null
+
+It is helpful to build a baseline, or null, model from which to compare. This model is simple, non-informative that always predicts the largest class. These are used as a simple heuristic to assess modeling effort.
+
+```{r 2-null-model}
+null_classification <- null_model() %>%
+  set_engine("parsnip") %>%
+  set_mode("classification")
+
+null_rs <- workflow() %>%
+  add_recipe(complaints_rec) %>%
+  add_model(null_classification) %>%
+  fit_resamples(
+    complaints_folds
+  )
+```
+
+
+**Collect Metrics**
+
+```{r 2-performance}
+null_rs %>%
+  collect_metrics()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## Meeting Videos
 
 ### Cohort 1
