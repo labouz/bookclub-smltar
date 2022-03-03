@@ -1,13 +1,219 @@
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(
+  # collapse = TRUE
+  warning = FALSE,
+  message = FALSE,
+  comment = "",
+  results = "markup",
+  cache = TRUE
+)
+# libraries
+library(tidyverse)
+```
+
+
 # Classification
 
 **Learning objectives:**
 
-- (these are optional but helpful)
+- Learn how text can be used in a classification model  
+- Learn how to tune hyperparameters of a model  
+- Learn how to compare different model types  
+- Understand that models can combine textual and non-textual predictors  
+- Learn about engineering custom features for ML  
+- Learn the performance metrics for classification models  
 
-## Slide 1
+## Classification - What's that?
 
-- Add slides as sections (marked with `##`).
-- Please give code chunks unique names (such as "01-something" for a block in chapter 1). This makes debugging much easier.
+> Predict a class label or group membership  
+
+!["https://www.analyticsvidhya.com/blog/2020/11/popular-classification-models-for-machine-learning/"](img/regression-vs-classification-in-machine-learning.png)
+
+### The Data
+
+*The Consumer Complaint Database* : financial product and service complaints  
+
+```{r 0-data, echo=FALSE}
+# can be downloaded here: https://www.consumerfinance.gov/data-research/consumer-complaints/
+# warning: it is a large file (~1.5GB)
+complaints <- read_csv("data/complaints.csv")
+glimpse(complaints)
+```
+- note: since this chapter was written, the number of observation rose from ~117K to ~2.5M so the outputs may differ
+
+## First Classification Model
+
+- **Goal**: predict if a complaint is referring to credit reporting, credit repair services, or other personal reports
+- **Outcome**: `product`: transformed into a binary var with levels `{Credit, Other}`  
+- **Explanatory**: `consumer_complaint_narrative`
+
+First step: understand the structure of the narrative as it will be used to predict the type of complaint. This variable will likely need some pre-processing but at the moment we will start simple.  
+
+```{r 1-view-narrative}
+head(complaints$consumer_complaint_narrative)
+```
+
+*Notice the frequency of strings containing 'Xs (to protect private information) and that prices are surrounded by `{}`*
+
+### LET'S START MODELING!
+
+```{r 1-model}
+library(tidymodels)
+
+# vars in the data used by the book are all lower case vs raw data pull 3/2/22
+complaints <- janitor::clean_names(complaints)
+
+set.seed(1234)
+# Re-factor product into a binary variable
+complaints2class <- complaints %>%
+  mutate(product = factor(if_else(
+    product == "Credit reporting, credit repair services, or other personal consumer reports",
+    "Credit", "Other"
+  )))
+
+# create a single binary split of data
+complaints_split <- initial_split(complaints2class, strata = product)
+
+complaints_train <- training(complaints_split)
+complaints_test <- testing(complaints_split)
+```
+
+Check the dims of the test and training data:
+
+```{r 1-dims}
+dim(complaints_train)
+
+dim(complaints_test)
+
+# we can observe at 25/75 split
+```
+
+### Pre-processing with `{textrecipes}`
+
+This includes tokenizing the narrative (tokens are words by default), filter the number of tokens based on frequency, and computing the tf-idf
+
+```{r 1-preproc}
+library(textrecipes)
+
+complaints_rec <-
+  # initiate the recipe
+  recipe(product ~ consumer_complaint_narrative, data = complaints_train) %>% 
+  # tokenize the narrative
+  step_tokenize(consumer_complaint_narrative) %>%
+  # filter the tokens based on the top 1000 most frequent
+  step_tokenfilter(consumer_complaint_narrative, max_tokens = 1e3) %>%
+  # calculate the tf-idf
+  step_tfidf(consumer_complaint_narrative)
+
+```
+
+Next, build a `{tidymodels}` workflow to bundle the recipe together:
+
+```{r 1-workflow}
+
+complaint_wf <- workflow() %>%
+  add_recipe(complaints_rec)
+```
+
+For our first model, we will utilize *Naïve Bayes*. Why? 
+
+### A Mini Primer on Naïve Bayes Classifier
+
+> A classification technique based on Bayes' Theorem with an assumption of independence among predictors. This algorithm uses the probability of an event that has already occured to estimate the probability of an event occuring. 
+
+Bayes Theorem: 
+
+![](img/bayes.png)
+
+* can be thought of "reversing" conditional probabilities.  
+  * when you need the probability of some event E conditional on event F but you only know the probability of F conditional on E occurring.  
+* it is "naïve" because of the assumption that the *exact conditional probability* of a vector of predictors, given observing an outcome, is sufficiently well estimated by the *product* of the i*ndividual conditional probabilities*.  
+   * in other words, we assume that each of the events in the feature vector are independent of each other
+   
+- A good simple [example](https://www.geeksforgeeks.org/naive-bayes-classifiers/)
+
+Naïve Bayes is easy and fast to predict class of test data set. It also perform well in multi-class predictions! So, because we have a discrete feature vector, and we can assume that each complaint is independent, we can use *Naïve Bayes* to classify the complaints!  
+
+### Set Engine
+
+```{r 1-engine}
+library(discrim)
+nb_spec <- naive_Bayes() %>%
+  set_mode("classification") %>%
+  set_engine("naivebayes")
+
+nb_spec
+```
+
+Now, we fit!
+
+```{r 1-fit}
+nb_fit <- complaint_wf %>%
+  add_model(nb_spec) %>%
+  fit(data = complaints_train)
+```
+
+
+### Evaluate
+
+**Create the folds:**
+
+```{r 1-evaluate}
+set.seed(234)
+# resample using k-folds (10)
+complaints_folds <- vfold_cv(complaints_train)
+
+complaints_folds
+```
+
+
+**Create the workflow:**
+
+```{r 1-wf2}
+nb_wf <- workflow() %>%
+  add_recipe(complaints_rec) %>%
+  add_model(nb_spec)
+
+nb_wf
+```
+
+**Fit the model to the folds:**
+
+```{r 1-fit2}
+nb_rs <- fit_resamples(
+  nb_wf,
+  complaints_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+**Get the performance metrics:**
+```{r 1-performance}
+nb_rs_metrics <- collect_metrics(nb_rs)
+nb_rs_predictions <- collect_predictions(nb_rs)
+```
+
+**Visualize Performance:**
+
+ROC Curve
+```{r 1-roc}
+nb_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = product, .pred_Credit) %>%
+  autoplot() +
+  labs(
+    color = NULL,
+    title = "ROC curve for US Consumer Finance Complaints",
+    subtitle = "Each resample fold is shown in a different color"
+  )
+```
+
+Confusion Matrix
+
+```{r 1-conf-matrix}
+conf_mat_resampled(nb_rs, tidy = FALSE) %>%
+  autoplot(type = "heatmap")
+```
 
 ## Meeting Videos
 
