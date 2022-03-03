@@ -7,3 +7,4 @@ _book
 _bookdown_files
 bookclub-smltar.Rmd
 bookclub-smltar_files
+*.csv
