@@ -241,22 +241,94 @@ null_rs %>%
 ```
 
 
+## Compare Lasso Classification Model
+
+*What's lasso classification model?*  
+It's a regularized linear model with variable selection.  
+
+*What's a regularized linear model?*  
+It's a type of linear regression where the coefficient estimates are constrained to zero.  
+ 
+ ![](img/tmm.jpeg)
+
+*..but why??*  
+To reduce the risk of overfitting by discouraging a linear model from learning more complex model that is usually caused by noise.  
+
+![](img/confused.jpeg)
+
+*So what?*  
+Lasso regression can be useful in cutting down the many features (tokens). It helps us choose a simpler model by penalizing features so we select only some of the features out of the high-dimensional space of possible tokens. 
 
 
 
+### Let's Lasso
+
+```{r 3-spec}
+lasso_spec <- logistic_reg(penalty = 0.01, mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+lasso_spec
+```
+
+
+**Workflow**
+
+```{r 3-wf}
+lasso_wf <- workflow() %>%
+  add_recipe(complaints_rec) %>%
+  add_model(lasso_spec)
+
+lasso_wf
+```
+
+
+**Fit**
+
+```{r 3-fit}
+set.seed(2020)
+lasso_rs <- fit_resamples(
+  lasso_wf,
+  complaints_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+**Get Performance Metrics**
+
+```{r 3-performance}
+lasso_rs_metrics <- collect_metrics(lasso_rs)
+lasso_rs_predictions <- collect_predictions(lasso_rs)
+lasso_rs_metrics
+
+```
+
+
+This looks promising!
+
+**Visualize**
+
+```{r 3-roc}
+lasso_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = product, .pred_Credit) %>%
+  autoplot() +
+  labs(
+    color = NULL,
+    title = "ROC curve for US Consumer Finance Complaints",
+    subtitle = "Each resample fold is shown in a different color"
+  )
+```
 
 
 
+```{r 3-confM}
+conf_mat_resampled(lasso_rs, tidy = FALSE) %>%
+  autoplot(type = "heatmap")
+```
 
 
-
-
-
-
-
-
-
-
+## Tuning Lasso Hyperparameters
 
 
 
