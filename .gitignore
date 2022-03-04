@@ -8,3 +8,5 @@ _bookdown_files
 bookclub-smltar.Rmd
 bookclub-smltar_files
 *.csv
+*.rda
+bookclub-smltar_cache/

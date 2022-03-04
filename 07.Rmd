@@ -93,6 +93,7 @@ dim(complaints_test)
 This includes tokenizing the narrative (tokens are words by default), filter the number of tokens based on frequency, and computing the tf-idf
 
 ```{r 1-preproc}
+rm(complaints)
 library(textrecipes)
 
 complaints_rec <-
@@ -113,6 +114,10 @@ Next, build a `{tidymodels}` workflow to bundle the recipe together:
 
 complaint_wf <- workflow() %>%
   add_recipe(complaints_rec)
+
+# save wf
+# save(complaint_wf, file = "data/1-wf.rda")
+load("data/1-wf.rda")
 ```
 
 For our first model, we will utilize *Naïve Bayes*. Why? 
@@ -330,10 +335,116 @@ conf_mat_resampled(lasso_rs, tidy = FALSE) %>%
 
 ## Tuning Lasso Hyperparameters
 
+`penalty=.01` was chosen arbitratily. So how do we know the right or best regulariazation parameter penalty?  We can learn to estimate a better value by traning many models on resampled data sets and seeing how they perform.
+
+**Model Tuning Specification**
+
+```{r 4-tune-spec}
+tune_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+tune_spec
+```
+
+**Create a grid of possible values**
+
+```{r 4-grid}
+# here we are using the penalty convenience function
+# grid_regular() chooses values to try for a parameter
+lambda_grid <- grid_regular(penalty(), levels = 30)
+lambda_grid
+```
 
 
+**Tune**
+```{r 4-wf}
+tune_wf <- workflow() %>%
+  add_recipe(complaints_rec) %>%
+  add_model(tune_spec)
+
+# use tune_grid() to fit the wf to every parameter in lambda grid
+set.seed(2020)
+tune_rs <- tune_grid(
+  tune_wf,
+  complaints_folds,
+  grid = lambda_grid,
+  control = control_resamples(save_pred = TRUE)
+)
+
+tune_rs
+```
+
+**Get Metrics**
+
+```{r 4-performance}
+collect_metrics(tune_rs)
+
+```
+
+**Visualize**
+
+```{r 4-viz}
+autoplot(tune_rs) +
+  labs(
+    title = "Lasso model performance across regularization penalties",
+    subtitle = "Performance metrics can be used to identity the best penalty"
+  )
+```
 
 
+**View best results**
+
+```{r 4-best}
+tune_rs %>%
+  show_best("roc_auc")
+```
+
+The best ROC AUC value is 0.953, but which is the best penalty value?  
+We could use `select_best` or we can use a simple model with higher regularization that will choose the the model with best ROC AUC within 1 standard error of the numerically best model.
+
+```{r 4-getauc}
+chosen_auc <- tune_rs %>%
+  select_by_one_std_err(metric = "roc_auc", -penalty)
+
+chosen_auc
+
+```
+
+**Final Workflow**
+
+Now, we circle back around and use this optimal penalty in our workflow!
+
+```{r 4-finalwf}
+final_lasso <- finalize_workflow(tune_wf, chosen_auc)
+
+final_lasso
+```
+
+**Fit lasso regularized model to training data**
+
+```{r 4-fitlasso}
+fitted_lasso <- fit(final_lasso, complaints_train)
+
+```
+
+**Which features contribute the most to a complaint not being about credit?**
+
+```{r 4-getcoeff}
+fitted_lasso %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  arrange(-estimate)
+```
+
+**Which features contribute the most to a complaint BEING about credit?**
+
+```{r 4-getcoeff2}
+fitted_lasso %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  arrange(estimate)
+```
 
 ## Meeting Videos
 
