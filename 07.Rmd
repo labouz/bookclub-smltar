@@ -4,7 +4,6 @@ knitr::opts_chunk$set(
   warning = FALSE,
   message = FALSE,
   comment = "",
-  results = "markup",
   cache = TRUE
 )
 # libraries
@@ -38,6 +37,9 @@ library(tidyverse)
 # warning: it is a large file (~1.5GB)
 complaints <- read_csv("data/complaints.csv")
 glimpse(complaints)
+
+# vars in the data used by the book are all lower case vs raw data pull 3/2/22
+complaints <- janitor::clean_names(complaints)
 ```
 - note: since this chapter was written, the number of observation rose from ~117K to ~2.5M so the outputs may differ
 
@@ -60,9 +62,6 @@ head(complaints$consumer_complaint_narrative)
 ```{r 1-model}
 library(tidymodels)
 
-# vars in the data used by the book are all lower case vs raw data pull 3/2/22
-complaints <- janitor::clean_names(complaints)
-
 set.seed(1234)
 # Re-factor product into a binary variable
 complaints2class <- complaints %>%
@@ -70,6 +69,10 @@ complaints2class <- complaints %>%
     product == "Credit reporting, credit repair services, or other personal consumer reports",
     "Credit", "Other"
   )))
+# for the sake of simplicity - removing any complaints with na
+complaints2class <- complaints2class %>% 
+  drop_na(consumer_complaint_narrative)
+# 2.5M -> 877K
 
 # create a single binary split of data
 complaints_split <- initial_split(complaints2class, strata = product)
@@ -117,7 +120,7 @@ complaint_wf <- workflow() %>%
 
 # save wf
 # save(complaint_wf, file = "data/1-wf.rda")
-load("data/1-wf.rda")
+# load("data/1-wf.rda")
 ```
 
 For our first model, we will utilize *Naïve Bayes*. Why? 
@@ -152,10 +155,11 @@ nb_spec
 
 Now, we fit!
 
-```{r 1-fit}
+```{r 1-fit, eval=FALSE, include=TRUE}
 nb_fit <- complaint_wf %>%
   add_model(nb_spec) %>%
   fit(data = complaints_train)
+# WARNING this is >12GB
 ```
 
 
@@ -163,12 +167,12 @@ nb_fit <- complaint_wf %>%
 
 **Create the folds:**
 
-```{r 1-evaluate}
+```{r 1-evaluate, eval=FALSE, include=TRUE}
 set.seed(234)
 # resample using k-folds (10)
 complaints_folds <- vfold_cv(complaints_train)
 
-complaints_folds
+save(complaints_folds,file = "data/complaints_folds.rda")
 ```
 
 
@@ -184,7 +188,12 @@ nb_wf
 
 **Fit the model to the folds:**
 
-```{r 1-fit2}
+```{r 1-fit2, eval=FALSE, include=TRUE}
+# remove things taking up lots of memory
+rm(complaints_split)
+# load saved files
+load("data/complaints_folds.rda")
+
 nb_rs <- fit_resamples(
   nb_wf,
   complaints_folds,
@@ -445,6 +454,290 @@ fitted_lasso %>%
   tidy() %>%
   arrange(estimate)
 ```
+
+
+## Case-study: Sparse Encoding
+
+Regularized regression models can be more efficient when text data is transformed to a sparse matrix rather than a dense dataframe or tibble.
+
+To do this we use the `{hardhat}` package to set a blueprint for pre-processing
+
+```{r 5-bp}
+library(hardhat)
+sparse_bp <- default_recipe_blueprint(composition = "dgCMatrix")
+
+```
+
+
+**Create workflow with blueprint**
+
+```{r}
+sparse_wf <- workflow() %>%
+  # define how we want the data to be  passed to the model
+  add_recipe(complaints_rec, blueprint = sparse_bp) %>%
+  add_model(tune_spec)
+
+sparse_wf
+```
+
+We are still going to use lassso regularized model but this time, instead of using 30 levels, we will only try 20 and set a range to restrict the values.
+
+**Make lambda grid**
+
+```{r 5-grid}
+smaller_lambda <- grid_regular(penalty(range = c(-5, 0)), levels = 20)
+smaller_lambda
+```
+
+
+As in the previous section, we will use the lasso model to fit and assess each regularization parameter on each fold to find the best amount of regularization.
+
+**Tune**
+
+```{r 5-sparsetune}
+set.seed(2020)
+sparse_rs <- tune_grid(
+  sparse_wf,
+  complaints_folds,
+  grid = smaller_lambda
+)
+
+sparse_rs
+```
+
+**Check performance**
+
+```{r 5-performance}
+sparse_rs %>%
+  show_best("roc_auc")
+```
+
+Nearly identical ROC AUC values! But the advantage here is that processing is faster when use a sparse encoding blueprint.
+Sparse encoding will be used for the rest of chapter, hooray!!! 
+
+## Two-Class or Multiclass?
+
+So far, we have 2 classes in our outcome (credit or other). This is straight-forward because it results in a simpler 2x2 contingency matrix. But, how do we deal with an outcome with more than 2 classes?
+
+**Recreate testing and training based on 9 levels of `product`**
+
+```{r 6-split}
+set.seed(1234)
+
+multicomplaints_split <- initial_split(complaints, strata = product)
+
+multicomplaints_train <- training(multicomplaints_split)
+multicomplaints_test <- testing(multicomplaints_split)
+
+```
+
+**Exploring the freq of complaints in each level**
+
+```{r 6-counts}
+multicomplaints_train %>%
+  count(product, sort = TRUE) %>%
+  select(n, product)
+```
+
+Notice: there is a significant class imbalance. This needs to be addressed before we can continue.
+
+Other possible issues to be mindful of:  
+
+- Many ML algorithms do not handle imbalanced data well and will give poor predictions for minority classes  
+- Not all ML algorithms are built for multiclass classification  
+- Many evaluation metrics must be reformulated to describe multiclass predictions  
+
+One of the simplest ways to handle imbalance is to downsample the majority classes.
+
+**Downsampling**
+
+```{r 6-downsample}
+library(themis)
+
+multicomplaints_rec <-
+  recipe(product ~ consumer_complaint_narrative,
+         data = multicomplaints_train) %>%
+  step_tokenize(consumer_complaint_narrative) %>%
+  step_tokenfilter(consumer_complaint_narrative, max_tokens = 1e3) %>%
+  step_tfidf(consumer_complaint_narrative) %>%
+  step_downsample(product)
+
+```
+
+**Create a new CV object**
+
+```{r 6-cv}
+multicomplaints_folds <- vfold_cv(multicomplaints_train)
+
+```
+
+**Re-create lasso spec**
+
+```{r 6-spec}
+multi_spec <- multinom_reg(penalty = tune(), mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+multi_spec
+```
+
+**Re-create WF**
+
+```{r 6-wf}
+multi_lasso_wf <- workflow() %>%
+  add_recipe(multicomplaints_rec, blueprint = sparse_bp) %>%
+  add_model(multi_spec)
+
+multi_lasso_wf
+```
+
+**Tune penalty to find appropriate value**
+
+```{r 6-tunegrid}
+multi_lasso_rs <- tune_grid(
+  multi_lasso_wf,
+  multicomplaints_folds,
+  grid = smaller_lambda,
+  control = control_resamples(save_pred = TRUE)
+)
+
+multi_lasso_rs
+```
+
+**Check Performance**
+
+```{r 6-performance}
+best_acc <- multi_lasso_rs %>%
+  show_best("accuracy")
+
+best_acc
+```
+
+Not as good as binary outcome, which makes sense.
+
+**Visualize the confusion matrix for the first fold**
+
+```{r 6-CM}
+multi_lasso_rs %>%
+  collect_predictions() %>%
+  filter(penalty == best_acc$penalty) %>%
+  filter(id == "Fold01") %>%
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_y_discrete(labels = function(x) str_wrap(x, 20)) +
+  scale_x_discrete(labels = function(x) str_wrap(x, 20))
+```
+
+
+If we remove the diagonal, we can get a better image of where the model doesn't do so well.
+
+```{r 6-CM2}
+multi_lasso_rs %>%
+  collect_predictions() %>%
+  filter(penalty == best_acc$penalty) %>%
+  filter(id == "Fold01") %>%
+  filter(.pred_class != product) %>%
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_y_discrete(labels = function(x) str_wrap(x, 20)) +
+  scale_x_discrete(labels = function(x) str_wrap(x, 20))
+```
+
+Now that we can see what is NOT working so well, we can study the data to try and create new features that would help the model better distinguish these classes.
+
+## Case-Study: Including Non-Text Data
+
+*Skipped*
+
+## Case-Study: Data Censoring
+
+*Skipped*
+
+## Case-Study: Creating Custom Features
+
+In section 7.6, the model did not perform so well on a multi-class outcome. This section will go over some tricks to build more predictive features than the naive search of tokens. If you know what you are looking for, you can likely build a function to find it, with a little help from regular expressions and domain knowledge.
+
+### Detecting credit cards
+
+Credit cards are represented as 16 numbers in the format "XXXX-XXXX-XXXX-XXXX". We could simply try `str_detect()`: 
+
+```{r 9-str}
+credit_cards <- c("my XXXX XXXX XXXX XXXX balance, and XXXX XXXX XXXX XXXX.",
+                  "card with number XXXX XXXX XXXX XXXX.",
+                  "at XX/XX 2019 my first",
+                  "live at XXXX XXXX XXXX XXXX XXXX SC")
+
+
+str_detect(credit_cards, "XXXX XXXX XXXX XXXX")
+```
+
+Not good enough...we need some regex.
+
+![](img/monkey.jpeg)
+
+```{r 9-regex}
+str_detect(credit_cards, "[^X] +XXXX XXXX XXXX XXXX(\\.| [^X])")
+```
+
+YAY!
+
+Now let's wrap that into a function!
+
+```{r 9-strfunc}
+creditcard_indicator <- function(x) {
+  str_detect(x, "[^X] +XXXX XXXX XXXX XXXX(\\.| [^X])")
+}
+
+creditcard_count <- function(x) {
+  str_count(x, "[^X] +XXXX XXXX XXXX XXXX(\\.| [^X])")
+}
+
+creditcard_indicator(credit_cards)
+
+creditcard_count(credit_cards)
+
+```
+
+## What Evaluation Metrics are Appropriate?
+
+ROC AUC are not the only metrics to evaluate performance for classification models. It really depends on how much you care about false negatives and false positives. Here, we can add popular metrics: precision and recall into our tuning grid. These metrics focus directly on false negatives and false positives. 
+
+Recall:  
+
+![](img/metrics.png)
+
+**Set metrics in tuning grid**
+
+```{r 10-metrics}
+nb_rs <- fit_resamples(
+  nb_wf,
+  complaints_folds,
+  metrics = metric_set(recall, precision)
+)
+```
+
+
+**Get Recall**
+
+```{r 10-recall}
+nb_rs_predictions %>%
+  recall(product, .pred_class)
+```
+
+Recall for each sample:
+
+```{r 10-recall2}
+nb_rs_predictions %>%
+  group_by(id) %>%
+  recall(product, .pred_class)
+```
+
+**Get CF of TP, TN, FP, FN rates**
+
+```{r 10-CM}
+conf_mat_resampled(nb_rs, tidy = FALSE)
+```
+
 
 ## Meeting Videos
 
